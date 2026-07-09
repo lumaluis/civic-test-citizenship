@@ -133,7 +133,7 @@ def parse_pdf(pdf_path: Path) -> list[dict[str, object]]:
 def write_js(questions: list[dict[str, object]], output_path: Path) -> None:
     payload = json.dumps(questions, indent=2, ensure_ascii=True)
     output_path.write_text(
-        "window.CIVICS_QUESTION_BANK = " + payload + ";\n",
+        "export const questionBank = " + payload + ";\n",
         encoding="utf-8",
     )
 
