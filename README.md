@@ -1,5 +1,7 @@
 # U.S. Citizenship Civics Practice
 
+This is an independent study tool. It is not a U.S. government website, is not affiliated with USCIS, and is not legal advice. For official naturalization guidance and test updates, use `https://www.uscis.gov/`.
+
 This project is now a Next.js App Router app built from the official 2025 USCIS civics PDF.
 
 ## Run it locally
