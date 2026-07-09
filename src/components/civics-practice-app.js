@@ -10,11 +10,13 @@ const sections = ["all", ...new Set(questionBank.map((question) => question.sect
 
 const baseState = {
   mode: "flashcards",
+  practiceStyle: "spoken",
   scope: "all",
   section: "all",
   category: "all",
   search: "",
   answerVisible: false,
+  selectedChoice: null,
   deck: [],
   cursor: 0,
   sessionComplete: false,
@@ -41,6 +43,36 @@ function shuffle(items) {
   }
 
   return copy;
+}
+
+function seededShuffle(items, seed) {
+  const copy = items.slice();
+  let value = seed % 2147483647;
+
+  if (value <= 0) {
+    value += 2147483646;
+  }
+
+  function nextRandom() {
+    value = (value * 16807) % 2147483647;
+    return (value - 1) / 2147483646;
+  }
+
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const randomIndex = Math.floor(nextRandom() * (index + 1));
+    [copy[index], copy[randomIndex]] = [copy[randomIndex], copy[index]];
+  }
+
+  return copy;
+}
+
+function normalizeChoice(value) {
+  return value
+    .toLowerCase()
+    .replace(/\[[^\]]*]/g, " ")
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
 function titleCase(value) {
@@ -81,6 +113,57 @@ function buildNotice(answerKind) {
   }
 
   return "";
+}
+
+function isAcceptedAnswer(question, answer) {
+  const normalizedAnswer = normalizeChoice(answer);
+
+  return question.answers.some((candidate) => normalizeChoice(candidate) === normalizedAnswer);
+}
+
+function buildChoiceOptions(question) {
+  if (question.answerKind !== "standard" || question.answers.length === 0) {
+    return [];
+  }
+
+  const correctAnswer = question.answers[0];
+  const seen = new Set([normalizeChoice(correctAnswer)]);
+  const distractors = [];
+  const preferred = questionBank.filter(
+    (candidate) =>
+      candidate.number !== question.number &&
+      candidate.answerKind === "standard" &&
+      (candidate.category === question.category || candidate.section === question.section),
+  );
+  const fallback = questionBank.filter(
+    (candidate) =>
+      candidate.number !== question.number &&
+      candidate.answerKind === "standard" &&
+      candidate.category !== question.category &&
+      candidate.section !== question.section,
+  );
+
+  for (const candidate of seededShuffle([...preferred, ...fallback], question.number * 13)) {
+    const option = candidate.answers[0];
+    const normalizedOption = normalizeChoice(option);
+
+    if (!normalizedOption || seen.has(normalizedOption)) {
+      continue;
+    }
+
+    seen.add(normalizedOption);
+    distractors.push(option);
+
+    if (distractors.length === 3) {
+      break;
+    }
+  }
+
+  if (distractors.length < 3) {
+    return [];
+  }
+
+  return seededShuffle([correctAnswer, ...distractors], question.number * 29);
 }
 
 function getSessionLength(mode, scope, poolSize) {
@@ -141,6 +224,7 @@ function rebuildSession(state) {
     sessionComplete: false,
     sessionStats: emptySessionStats(),
     draftAnswer: "",
+    selectedChoice: null,
   };
 }
 
@@ -156,6 +240,11 @@ function reducer(state, action) {
       return rebuildSession({
         ...state,
         mode: action.value,
+      });
+    case "setPracticeStyle":
+      return rebuildSession({
+        ...state,
+        practiceStyle: action.value,
       });
     case "setScope":
       return rebuildSession({
@@ -194,6 +283,43 @@ function reducer(state, action) {
         ...state,
         answerVisible: true,
       };
+    case "selectChoice": {
+      if (state.selectedChoice !== null) {
+        return state;
+      }
+
+      const questionNumber = state.deck[state.cursor];
+
+      if (questionNumber == null) {
+        return state;
+      }
+
+      const direction = action.correct ? "positive" : "negative";
+      const existing = state.progress[questionNumber] || {
+        seen: 0,
+        positive: 0,
+        negative: 0,
+      };
+
+      return {
+        ...state,
+        answerVisible: true,
+        selectedChoice: action.value,
+        progress: {
+          ...state.progress,
+          [questionNumber]: {
+            ...existing,
+            seen: existing.seen + 1,
+            [direction]: existing[direction] + 1,
+          },
+        },
+        sessionStats: {
+          ...state.sessionStats,
+          scored: state.sessionStats.scored + 1,
+          [direction]: state.sessionStats[direction] + 1,
+        },
+      };
+    }
     case "next": {
       if (state.deck.length === 0) {
         return state;
@@ -204,6 +330,7 @@ function reducer(state, action) {
           ...state,
           answerVisible: false,
           draftAnswer: "",
+          selectedChoice: null,
           sessionComplete: true,
         };
       }
@@ -212,6 +339,7 @@ function reducer(state, action) {
         ...state,
         answerVisible: false,
         draftAnswer: "",
+        selectedChoice: null,
         cursor: state.cursor + 1,
       };
     }
@@ -297,6 +425,11 @@ export default function CivicsPracticeApp() {
 
   const currentQuestion =
     state.sessionComplete || state.deck.length === 0 ? null : questionMap.get(state.deck[state.cursor]) || null;
+  const currentChoiceOptions = currentQuestion ? buildChoiceOptions(currentQuestion) : [];
+  const usingMultipleChoice = state.practiceStyle === "multiple" && currentChoiceOptions.length > 0;
+  const usingChoiceFallback = state.practiceStyle === "multiple" && currentQuestion && currentChoiceOptions.length === 0;
+  const selectedChoiceIsCorrect =
+    currentQuestion && state.selectedChoice ? isAcceptedAnswer(currentQuestion, state.selectedChoice) : false;
   const entries = Object.values(state.progress);
   const studied = entries.filter((entry) => entry.seen > 0).length;
   const strong = questionBank.filter((question) => confidenceScore(state.progress, question.number) >= 2).length;
@@ -333,11 +466,21 @@ export default function CivicsPracticeApp() {
     }`;
   }
 
+  if (state.practiceStyle === "multiple") {
+    sessionSummary = `${sessionSummary} Multiple choice shows one accepted answer and three distractors.`;
+  }
+
   const questionProgress = total ? `${Math.min(state.cursor + 1, total)} of ${total}` : "";
   const prompt = currentQuestion
-    ? state.mode === "mock"
-      ? "Pretend an officer asked this. Say your answer fully before revealing the official answer."
-      : "Answer from memory first. Then reveal the accepted answers and score how it felt."
+    ? usingMultipleChoice
+      ? state.answerVisible
+        ? "Review the accepted answers, then move on to the next question."
+        : "Pick the best accepted answer. After you choose, the app will score it automatically."
+      : usingChoiceFallback
+        ? "This one stays open response because the accepted answer can change by state or by current officials."
+        : state.mode === "mock"
+          ? "Pretend an officer asked this. Say your answer fully before revealing the official answer."
+          : "Answer from memory first. Then reveal the accepted answers and score how it felt."
     : state.sessionComplete
       ? "Start another session or switch filters to keep practicing."
       : "Try another section, clear the search box, or study some questions first so your review queue has data.";
@@ -381,6 +524,15 @@ export default function CivicsPracticeApp() {
         </div>
       </header>
 
+      <section className="panel disclaimer-banner" aria-label="Site disclaimer">
+        <strong>Study app disclaimer</strong>
+        <p>
+          This is an independent study tool created to help people practice civics questions. It is not a U.S.
+          government website, not affiliated with USCIS, and not official legal advice. For official test updates
+          and naturalization guidance, use USCIS.gov.
+        </p>
+      </section>
+
       <section className="panel toolbar">
         <div className="control-group">
           <span className="control-label">Mode</span>
@@ -395,6 +547,25 @@ export default function CivicsPracticeApp() {
                 className={`segment${state.mode === value ? " is-active" : ""}`}
                 type="button"
                 onClick={() => startTransition(() => dispatch({ type: "setMode", value }))}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="control-group">
+          <span className="control-label">Answer style</span>
+          <div className="segmented">
+            {[
+              ["spoken", "Oral recall"],
+              ["multiple", "Multiple choice"],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                className={`segment${state.practiceStyle === value ? " is-active" : ""}`}
+                type="button"
+                onClick={() => startTransition(() => dispatch({ type: "setPracticeStyle", value }))}
               >
                 {label}
               </button>
@@ -487,20 +658,64 @@ export default function CivicsPracticeApp() {
               <h2 className="question-text">{currentQuestion.question}</h2>
               <p className="question-prompt">{prompt}</p>
 
-              <label className="response-area">
-                <span>Optional: type a rough answer, or just say it out loud first.</span>
-                <textarea
-                  rows="4"
-                  value={state.draftAnswer}
-                  placeholder="Example: Congress writes laws..."
-                  onChange={(event) =>
-                    dispatch({
-                      type: "setDraftAnswer",
-                      value: event.target.value,
-                    })
-                  }
-                />
-              </label>
+              {usingMultipleChoice ? (
+                <section className="choice-panel" aria-label="Multiple choice answers">
+                  <div className="choice-grid">
+                    {currentChoiceOptions.map((option) => {
+                      const isSelected = state.selectedChoice === option;
+                      const isCorrect = state.answerVisible && isAcceptedAnswer(currentQuestion, option);
+                      const isMissedCorrect = state.answerVisible && !selectedChoiceIsCorrect && isCorrect;
+                      const choiceClassName = [
+                        "choice-button",
+                        isSelected ? " is-selected" : "",
+                        isCorrect ? " is-correct" : "",
+                        isMissedCorrect ? " is-revealed" : "",
+                        isSelected && !selectedChoiceIsCorrect ? " is-incorrect" : "",
+                      ].join("");
+
+                      return (
+                        <button
+                          key={option}
+                          className={choiceClassName}
+                          type="button"
+                          disabled={state.answerVisible}
+                          onClick={() =>
+                            dispatch({
+                              type: "selectChoice",
+                              value: option,
+                              correct: isAcceptedAnswer(currentQuestion, option),
+                            })
+                          }
+                        >
+                          {option}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              ) : (
+                <label className="response-area">
+                  <span>Optional: type a rough answer, or just say it out loud first.</span>
+                  <textarea
+                    rows="4"
+                    value={state.draftAnswer}
+                    placeholder="Example: Congress writes laws..."
+                    onChange={(event) =>
+                      dispatch({
+                        type: "setDraftAnswer",
+                        value: event.target.value,
+                      })
+                    }
+                  />
+                </label>
+              )}
+
+              {usingChoiceFallback ? (
+                <p className="choice-note">
+                  This question depends on current officials or your own state details, so the app keeps it in
+                  oral practice instead of forcing a multiple-choice guess.
+                </p>
+              ) : null}
 
               {state.answerVisible ? (
                 <div className="answer-card">
@@ -511,6 +726,13 @@ export default function CivicsPracticeApp() {
                       {currentQuestion.answers.length === 1 ? "" : "s"}
                     </span>
                   </div>
+                  {state.selectedChoice ? (
+                    <p className={`choice-feedback${selectedChoiceIsCorrect ? " is-correct" : " is-incorrect"}`}>
+                      {selectedChoiceIsCorrect
+                        ? "Nice. Your choice matches an accepted USCIS answer."
+                        : "Not quite. The highlighted answer is accepted, and the full list below shows every accepted version."}
+                    </p>
+                  ) : null}
                   <ul className="answer-list">
                     {currentQuestion.answers.map((answer) => (
                       <li key={answer}>{answer}</li>
@@ -525,11 +747,11 @@ export default function CivicsPracticeApp() {
               <div className="question-actions">
                 {!state.answerVisible ? (
                   <button className="primary-button" type="button" onClick={() => dispatch({ type: "reveal" })}>
-                    Reveal answer
+                    {usingMultipleChoice ? "Show answers instead" : "Reveal answer"}
                   </button>
                 ) : null}
 
-                {state.answerVisible ? (
+                {state.answerVisible && state.selectedChoice === null ? (
                   <>
                     <button
                       className="success-button"
